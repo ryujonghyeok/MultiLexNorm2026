@@ -23,7 +23,7 @@ def mfr(input_sent, counts):
 
 
 
-def evaluate(raw, gold, pred, ignCaps=False, verbose=False):
+def evaluate(raw, gold, pred, ignCaps=False, verbose=False, info=True):
     cor = 0
     changed = 0
     total = 0
@@ -51,9 +51,10 @@ def evaluate(raw, gold, pred, ignCaps=False, verbose=False):
     lai = (total - changed) / total
     err = (accuracy - lai) / (1-lai)
 
-    print('Baseline acc.(LAI): {:.2f}'.format(lai * 100)) 
-    print('Accuracy:           {:.2f}'.format(accuracy * 100)) 
-    print('ERR:                {:.2f}'.format(err * 100))
+    if info:
+        print('Baseline acc.(LAI): {:.2f}'.format(lai * 100)) 
+        print('Accuracy:           {:.2f}'.format(accuracy * 100)) 
+        print('ERR:                {:.2f}'.format(err * 100))
 
     return lai, accuracy, err
 
