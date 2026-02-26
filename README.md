@@ -4,7 +4,7 @@ It demonstrates how to download the dataset, run a simple baseline model (MFR), 
 
 
 - [**Full code is available here**](demo.ipynb).
-- The datasets will be available at [dev](https://huggingface.co/datasets/weerayut/multilexnorm2026-dev-pub) and [full](https://huggingface.co/datasets/weerayut/multilexnorm2026-dev-pub).
+- The datasets will be available at [development phase](https://huggingface.co/datasets/weerayut/multilexnorm2026-dev-pub) and [final phase](https://huggingface.co/datasets/weerayut/multilexnorm2026-dev-pub).
 - Example MFR submission outputs: `outputs/submission_dev.zip` and `outputs/submission_full.zip`
 
 ## Set up the environment
