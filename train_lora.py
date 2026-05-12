@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--grad-accum-steps", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
@@ -62,6 +63,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-steps", type=int, default=50)
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataloader-num-workers", type=int, default=2)
+    parser.add_argument("--no-gradient-checkpointing", action="store_true")
+    parser.add_argument("--no-group-by-length", action="store_true")
+    parser.add_argument(
+        "--optim",
+        default="auto",
+        help="Trainer optimizer. Use 'auto' for a GPU-friendly default.",
+    )
 
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -84,6 +93,14 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.no_4bit:
         args.quantization = "none"
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be greater than 0")
+    if args.eval_batch_size <= 0:
+        parser.error("--eval-batch-size must be greater than 0")
+    if args.grad_accum_steps <= 0:
+        parser.error("--grad-accum-steps must be greater than 0")
+    if args.max_length <= 0:
+        parser.error("--max-length must be greater than 0")
     return args
 
 
@@ -230,12 +247,24 @@ def make_training_args(args: argparse.Namespace, has_eval: bool) -> Any:
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     use_fp16 = torch.cuda.is_available() and not use_bf16
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    if args.optim != "auto":
+        optim = args.optim
+    elif args.quantization == "4bit":
+        optim = "paged_adamw_8bit"
+    elif torch.cuda.is_available():
+        optim = "adamw_torch_fused"
+    else:
+        optim = "adamw_torch"
 
     kwargs: dict[str, Any] = {
         "output_dir": args.output_dir,
         "num_train_epochs": args.epochs,
         "per_device_train_batch_size": args.batch_size,
-        "per_device_eval_batch_size": 1,
+        "per_device_eval_batch_size": args.eval_batch_size,
         "gradient_accumulation_steps": args.grad_accum_steps,
         "learning_rate": args.learning_rate,
         "warmup_ratio": args.warmup_ratio,
@@ -244,14 +273,22 @@ def make_training_args(args: argparse.Namespace, has_eval: bool) -> Any:
         "save_total_limit": 2,
         "bf16": use_bf16,
         "fp16": use_fp16,
-        "optim": "paged_adamw_8bit" if args.quantization == "4bit" else "adamw_torch",
+        "optim": optim,
         "report_to": "none",
         "remove_unused_columns": False,
-        "gradient_checkpointing": True,
+        "gradient_checkpointing": not args.no_gradient_checkpointing,
         "seed": args.seed,
     }
 
     signature = inspect.signature(TrainingArguments.__init__).parameters
+    if "group_by_length" in signature:
+        kwargs["group_by_length"] = not args.no_group_by_length
+    if "dataloader_num_workers" in signature:
+        kwargs["dataloader_num_workers"] = args.dataloader_num_workers
+    if "dataloader_pin_memory" in signature:
+        kwargs["dataloader_pin_memory"] = torch.cuda.is_available()
+    if "tf32" in signature:
+        kwargs["tf32"] = torch.cuda.is_available()
     eval_value = "steps" if has_eval else "no"
     if "eval_strategy" in signature:
         kwargs["eval_strategy"] = eval_value
