@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-examples", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--fallback", choices=["raw", "mfr"], default="mfr")
     parser.add_argument("--preview-examples", type=int, default=5)
+    parser.add_argument(
+        "--disable-stop-after-json",
+        action="store_true",
+        help="Keep generating until max_new_tokens instead of stopping after a valid JSON token list.",
+    )
     return parser.parse_args()
 
 
@@ -149,20 +154,61 @@ def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[A
     return model, tokenizer
 
 
-def generate_one(model: Any, tokenizer: Any, row: dict[str, Any], max_new_tokens: int) -> str:
+def generation_config_for_inference(model: Any, tokenizer: Any) -> dict[str, Any]:
+    generation_config = model.generation_config
+    generation_config.do_sample = False
+    generation_config.top_p = None
+    generation_config.top_k = None
+    return {
+        "do_sample": False,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "generation_config": generation_config,
+    }
+
+
+def make_stop_after_json(tokenizer: Any, prompt_len: int, expected_len: int) -> Any:
+    from transformers import StoppingCriteria
+
+    class StopAfterValidJsonList(StoppingCriteria):
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
+            generated_ids = input_ids[0][prompt_len:]
+            text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            parsed = parse_json_list(text)
+            return (
+                isinstance(parsed, list)
+                and len(parsed) == expected_len
+                and all(isinstance(token, str) for token in parsed)
+            )
+
+    return StopAfterValidJsonList()
+
+
+def generate_one(
+    model: Any,
+    tokenizer: Any,
+    row: dict[str, Any],
+    max_new_tokens: int,
+    stop_after_json: bool,
+) -> str:
     import torch
+    from transformers import StoppingCriteriaList
 
     prompt = render_prompt(tokenizer, row)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_len = inputs["input_ids"].shape[-1]
+    stopping_criteria = None
+    if stop_after_json:
+        stopping_criteria = StoppingCriteriaList([make_stop_after_json(tokenizer, prompt_len, len(as_list(row["raw"])))])
+
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            stopping_criteria=stopping_criteria,
+            **generation_config_for_inference(model, tokenizer),
         )
-    generated_ids = output_ids[0][inputs["input_ids"].shape[-1] :]
+    generated_ids = output_ids[0][prompt_len:]
     return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
 
@@ -213,7 +259,13 @@ def main() -> None:
         if len(norm) != len(raw):
             norm = [""] * len(raw)
 
-        generated_text = generate_one(model, tokenizer, row, args.max_new_tokens)
+        generated_text = generate_one(
+            model,
+            tokenizer,
+            row,
+            args.max_new_tokens,
+            stop_after_json=not args.disable_stop_after_json,
+        )
         pred, source = normalize_prediction(generated_text, raw, row["lang"], args.fallback, counts_by_lang)
         source_counts[source] += 1
 
@@ -223,8 +275,8 @@ def main() -> None:
             print(f"\nExample {idx + 1}")
             print("lang:", row["lang"])
             print("raw: ", raw)
-            print("text:", generated_text)
-            print("pred:", pred)
+            print("model_text:", generated_text)
+            print("submitted_pred:", pred)
             print("source:", source)
 
     for idx, record in enumerate(records):
