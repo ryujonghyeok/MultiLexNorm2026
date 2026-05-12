@@ -297,7 +297,7 @@ def main() -> None:
             print("lang:", row["lang"])
             print("raw: ", raw)
             print("model_text:", generated_text)
-            print("submitted_pred:", pred)
+            print("pred:", pred)
             print("source:", source)
 
     for idx, record in enumerate(records):
