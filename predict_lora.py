@@ -22,7 +22,7 @@ from train_lora import (
     render_prompt,
     timestamped_name,
 )
-from utils import counting, mfr
+from utils import counting, evaluate, mfr
 
 
 def check_torchao_version() -> None:
@@ -80,6 +80,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-examples", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--fallback", choices=["raw", "mfr"], default="mfr")
+    parser.add_argument(
+        "--prediction-strategy",
+        choices=["model", "mfr", "mfr-known", "mfr-confidence"],
+        default="mfr-known",
+        help=(
+            "How to combine model predictions with MFR. "
+            "'model' uses valid model JSON directly. "
+            "'mfr' ignores the model output. "
+            "'mfr-known' uses MFR for tokens seen in public train/validation and model only for unseen tokens. "
+            "'mfr-confidence' uses model only when MFR confidence is below --mfr-confidence-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--mfr-confidence-threshold",
+        type=float,
+        default=0.75,
+        help="For --prediction-strategy mfr-confidence, use MFR when top replacement frequency is at least this value.",
+    )
     parser.add_argument("--preview-examples", type=int, default=5)
     parser.add_argument(
         "--progress-steps",
@@ -102,6 +120,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be 0 or greater")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be greater than 0")
+    if not 0.0 <= args.mfr_confidence_threshold <= 1.0:
+        parser.error("--mfr-confidence-threshold must be between 0 and 1")
     return args
 
 
@@ -152,17 +172,72 @@ def fallback_prediction(raw: list[str], lang: str, fallback: str, counts_by_lang
     return list(raw)
 
 
-def normalize_prediction(
-    generated_text: str,
+def mfr_token_prediction(raw_token: str, token_counts: dict[str, dict[str, int]]) -> str:
+    if raw_token not in token_counts:
+        return raw_token
+    return max(token_counts[raw_token], key=token_counts[raw_token].get)
+
+
+def mfr_token_confidence(raw_token: str, token_counts: dict[str, dict[str, int]]) -> float:
+    if raw_token not in token_counts:
+        return 0.0
+    replacements = token_counts[raw_token]
+    total = sum(replacements.values())
+    if total <= 0:
+        return 0.0
+    return max(replacements.values()) / total
+
+
+def parse_model_prediction(generated_text: str, raw: list[str]) -> list[str] | None:
+    parsed = parse_json_list(generated_text)
+    if isinstance(parsed, list) and len(parsed) == len(raw) and all(isinstance(token, str) for token in parsed):
+        return parsed
+    return None
+
+
+def choose_prediction(
+    model_pred: list[str] | None,
     raw: list[str],
     lang: str,
     fallback: str,
     counts_by_lang: dict[str, Any] | None,
+    strategy: str,
+    mfr_confidence_threshold: float,
 ) -> tuple[list[str], str]:
-    parsed = parse_json_list(generated_text)
-    if isinstance(parsed, list) and len(parsed) == len(raw) and all(isinstance(token, str) for token in parsed):
-        return parsed, "model"
-    return fallback_prediction(raw, lang, fallback, counts_by_lang), "fallback"
+    fallback_pred = fallback_prediction(raw, lang, fallback, counts_by_lang)
+    if strategy == "mfr":
+        return fallback_pred, "mfr"
+    if model_pred is None:
+        return fallback_pred, "fallback"
+    if strategy == "model" or counts_by_lang is None:
+        return model_pred, "model"
+
+    token_counts = counts_by_lang.get(lang, {})
+    pred = []
+    model_used = 0
+    for raw_token, model_token in zip(raw, model_pred):
+        if strategy == "mfr-known":
+            use_mfr = raw_token in token_counts
+        elif strategy == "mfr-confidence":
+            use_mfr = mfr_token_confidence(raw_token, token_counts) >= mfr_confidence_threshold
+        else:
+            use_mfr = False
+
+        if use_mfr:
+            pred.append(mfr_token_prediction(raw_token, token_counts))
+        else:
+            pred.append(model_token)
+            model_used += 1
+
+    if model_used == 0:
+        return pred, "mfr"
+    if model_used == len(raw):
+        return pred, "model"
+    return pred, "hybrid"
+
+
+def has_public_gold(records: list[dict[str, Any]]) -> bool:
+    return any(any(token != "" for token in record["norm"]) for record in records)
 
 
 def format_duration(seconds: float) -> str:
@@ -351,6 +426,9 @@ def main() -> None:
     print("Split:", args.split)
     print("Run timestamp (KST):", run_timestamp_kst)
     print("Output directory:", output_dir)
+    print("Prediction strategy:", args.prediction_strategy)
+    if args.prediction_strategy == "mfr-confidence":
+        print("MFR confidence threshold:", args.mfr_confidence_threshold)
 
     data = load_multilexnorm(args.dataset_id)
     target = data[args.split]
@@ -359,7 +437,8 @@ def main() -> None:
     print("Prediction rows:", len(target))
     print("Length-sorted batching:", "disabled" if args.no_sort_by_length else "enabled")
 
-    counts_by_lang = make_mfr_counts(data) if args.fallback == "mfr" else None
+    needs_mfr_counts = args.fallback == "mfr" or args.prediction_strategy in {"mfr", "mfr-known", "mfr-confidence"}
+    counts_by_lang = make_mfr_counts(data) if needs_mfr_counts else None
     model, tokenizer = load_model_and_tokenizer(args, model_id)
     batch_size, batch_size_reason = choose_batch_size(args.batch_size, args.max_new_tokens)
     print(f"Batch size: {batch_size} ({batch_size_reason})")
@@ -369,7 +448,7 @@ def main() -> None:
         indexed_rows.sort(key=lambda item: len(as_list(item[1]["raw"])))
 
     records: list[dict[str, Any] | None] = [None] * len(target)
-    source_counts = {"model": 0, "fallback": 0}
+    source_counts = {"model": 0, "hybrid": 0, "mfr": 0, "fallback": 0}
     completed = 0
     started_at = time.monotonic()
     next_progress = args.progress_steps if args.progress_steps > 0 else None
@@ -405,7 +484,16 @@ def main() -> None:
             if len(norm) != len(raw):
                 norm = [""] * len(raw)
 
-            pred, source = normalize_prediction(generated_text, raw, row["lang"], args.fallback, counts_by_lang)
+            model_pred = parse_model_prediction(generated_text, raw)
+            pred, source = choose_prediction(
+                model_pred,
+                raw,
+                row["lang"],
+                args.fallback,
+                counts_by_lang,
+                args.prediction_strategy,
+                args.mfr_confidence_threshold,
+            )
             source_counts[source] += 1
 
             records[idx] = {"raw": raw, "norm": norm, "lang": row["lang"], "pred": pred}
@@ -437,7 +525,8 @@ def main() -> None:
                 f"{rows_per_second:.2f} rows/s | "
                 f"elapsed {format_duration(elapsed)} | "
                 f"ETA {format_duration(eta)} | "
-                f"model {source_counts['model']} / fallback {source_counts['fallback']}",
+                f"model {source_counts['model']} / hybrid {source_counts['hybrid']} / "
+                f"mfr {source_counts['mfr']} / fallback {source_counts['fallback']}",
                 flush=True,
             )
 
@@ -452,6 +541,13 @@ def main() -> None:
         final_records.append(record)
 
     predictions_path, zip_path = write_submission(final_records, output_dir)
+    if has_public_gold(final_records):
+        print("\nValidation score:")
+        evaluate(
+            raw=[record["raw"] for record in final_records],
+            gold=[record["norm"] for record in final_records],
+            pred=[record["pred"] for record in final_records],
+        )
     print("\nPrediction source counts:", source_counts)
     print(f"Wrote {predictions_path}")
     print(f"Wrote {zip_path}")
