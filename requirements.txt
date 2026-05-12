@@ -1,4 +1,13 @@
 pyarrow==14.0.2
 datasets==2.19.2
 numpy<2.0
-pandas<2.0
+pandas>=2.2,<3.0
+torch
+transformers
+accelerate
+peft
+torchao>=0.16.0
+bitsandbytes
+sentencepiece
+protobuf
+packaging

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -21,6 +22,24 @@ from train_lora import (
     timestamped_name,
 )
 from utils import counting, mfr
+
+
+def check_torchao_version() -> None:
+    try:
+        version = importlib.metadata.version("torchao")
+    except importlib.metadata.PackageNotFoundError:
+        return
+
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return
+
+    if Version(version) < Version("0.16.0"):
+        raise RuntimeError(
+            f"Found torchao=={version}, but PEFT requires torchao>=0.16.0 in this environment. "
+            "Run: pip install -U 'torchao>=0.16.0' or rerun pip install -U -r requirements.txt"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +168,7 @@ def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[A
         quantization_config=quantization_config,
         token=args.hf_token,
     )
+    check_torchao_version()
     model = PeftModel.from_pretrained(base_model, args.adapter_dir)
     model.eval()
     return model, tokenizer
