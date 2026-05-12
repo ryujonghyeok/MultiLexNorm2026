@@ -1,13 +1,11 @@
 pyarrow>=15.0.2
 datasets>=2.19.2
 numpy>=2.0,<2.1
-pandas>=2.2,<3.0
-torch
+pandas==2.2.2
 transformers
 accelerate
 peft
-torchao>=0.16.0
 bitsandbytes
 sentencepiece
-protobuf
+protobuf>=5.26.1,<6.0
 packaging

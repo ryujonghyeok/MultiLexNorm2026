@@ -38,7 +38,8 @@ def check_torchao_version() -> None:
     if Version(version) < Version("0.16.0"):
         raise RuntimeError(
             f"Found torchao=={version}, but PEFT requires torchao>=0.16.0 in this environment. "
-            "Run: pip install -U 'torchao>=0.16.0' or rerun pip install -U -r requirements.txt"
+            "In Colab, run: pip uninstall -y torchao, then rerun prediction. "
+            "Do not upgrade torch just to satisfy torchao."
         )
 
 
