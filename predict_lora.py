@@ -8,6 +8,7 @@ import importlib.metadata
 import json
 import os
 import re
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -75,7 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-examples", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--fallback", choices=["raw", "mfr"], default="mfr")
     parser.add_argument("--preview-examples", type=int, default=5)
-    parser.add_argument("--progress-steps", type=int, default=100)
+    parser.add_argument(
+        "--progress-steps",
+        type=int,
+        default=100,
+        help="Print progress every N completed rows. Use 0 to disable progress logs.",
+    )
     parser.add_argument(
         "--no-sort-by-length",
         action="store_true",
@@ -152,6 +158,17 @@ def normalize_prediction(
     if isinstance(parsed, list) and len(parsed) == len(raw) and all(isinstance(token, str) for token in parsed):
         return parsed, "model"
     return fallback_prediction(raw, lang, fallback, counts_by_lang), "fallback"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m {seconds:02d}s"
+    return f"{seconds:d}s"
 
 
 def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[Any, Any]:
@@ -298,6 +315,8 @@ def main() -> None:
     records: list[dict[str, Any] | None] = [None] * len(target)
     source_counts = {"model": 0, "fallback": 0}
     completed = 0
+    started_at = time.monotonic()
+    next_progress = args.progress_steps if args.progress_steps > 0 else None
     for batch_start in range(0, len(indexed_rows), args.batch_size):
         batch_end = min(batch_start + args.batch_size, len(indexed_rows))
         indexed_batch = indexed_rows[batch_start:batch_end]
@@ -330,8 +349,26 @@ def main() -> None:
                 print("source:", source)
 
         completed += len(indexed_batch)
-        if args.progress_steps > 0 and (completed % args.progress_steps == 0 or completed == len(target)):
-            print(f"Predicted {completed}/{len(target)} rows")
+        should_print_progress = completed == len(target)
+        if next_progress is not None and completed >= next_progress:
+            should_print_progress = True
+            while next_progress is not None and completed >= next_progress:
+                next_progress += args.progress_steps
+        if should_print_progress:
+            elapsed = time.monotonic() - started_at
+            rows_per_second = completed / elapsed if elapsed > 0 else 0.0
+            remaining = len(target) - completed
+            eta = remaining / rows_per_second if rows_per_second > 0 else 0.0
+            percent = (completed / len(target) * 100) if len(target) else 100.0
+            print(
+                "Progress: "
+                f"{completed}/{len(target)} rows ({percent:.1f}%) | "
+                f"{rows_per_second:.2f} rows/s | "
+                f"elapsed {format_duration(elapsed)} | "
+                f"ETA {format_duration(eta)} | "
+                f"model {source_counts['model']} / fallback {source_counts['fallback']}",
+                flush=True,
+            )
 
     final_records: list[dict[str, Any]] = []
     for idx, record in enumerate(records):
