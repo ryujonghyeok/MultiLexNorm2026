@@ -72,7 +72,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--quantization", choices=["4bit", "none"], default="4bit")
     parser.add_argument("--max-new-tokens", type=int, default=96)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Rows per generation batch. Use 0 to choose automatically from available GPU memory.",
+    )
     parser.add_argument("--max-examples", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--fallback", choices=["raw", "mfr"], default="mfr")
     parser.add_argument("--preview-examples", type=int, default=5)
@@ -93,8 +98,8 @@ def parse_args() -> argparse.Namespace:
         help="Keep generating until max_new_tokens instead of stopping after a valid JSON token list.",
     )
     args = parser.parse_args()
-    if args.batch_size <= 0:
-        parser.error("--batch-size must be greater than 0")
+    if args.batch_size < 0:
+        parser.error("--batch-size must be 0 or greater")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be greater than 0")
     return args
@@ -169,6 +174,56 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes:d}m {seconds:02d}s"
     return f"{seconds:d}s"
+
+
+def choose_batch_size(requested_batch_size: int, max_new_tokens: int) -> tuple[int, str]:
+    if requested_batch_size > 0:
+        return requested_batch_size, "manual"
+
+    try:
+        import torch
+    except ImportError:
+        return 1, "auto: torch unavailable"
+
+    if not torch.cuda.is_available():
+        return 1, "auto: CUDA unavailable"
+
+    device_index = torch.cuda.current_device()
+    device_name = torch.cuda.get_device_name(device_index)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+    free_gb = free_bytes / (1024**3)
+    total_gb = total_bytes / (1024**3)
+
+    if free_gb >= 70:
+        batch_size = 128
+    elif free_gb >= 35:
+        batch_size = 64
+    elif free_gb >= 20:
+        batch_size = 32
+    elif free_gb >= 12:
+        batch_size = 16
+    else:
+        batch_size = 8
+
+    if max_new_tokens > 128:
+        batch_size = max(1, batch_size // 2)
+
+    reason = f"auto: {device_name}, free {free_gb:.1f}/{total_gb:.1f} GB GPU RAM"
+    return batch_size, reason
+
+
+def clear_cuda_cache() -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def is_cuda_out_of_memory(error: Exception) -> bool:
+    message = str(error).lower()
+    return "cuda" in message and "out of memory" in message
 
 
 def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[Any, Any]:
@@ -302,11 +357,12 @@ def main() -> None:
     if args.max_examples and args.max_examples > 0:
         target = target.select(range(min(args.max_examples, len(target))))
     print("Prediction rows:", len(target))
-    print("Batch size:", args.batch_size)
     print("Length-sorted batching:", "disabled" if args.no_sort_by_length else "enabled")
 
     counts_by_lang = make_mfr_counts(data) if args.fallback == "mfr" else None
     model, tokenizer = load_model_and_tokenizer(args, model_id)
+    batch_size, batch_size_reason = choose_batch_size(args.batch_size, args.max_new_tokens)
+    print(f"Batch size: {batch_size} ({batch_size_reason})")
 
     indexed_rows = list(enumerate(target))
     if not args.no_sort_by_length:
@@ -317,17 +373,31 @@ def main() -> None:
     completed = 0
     started_at = time.monotonic()
     next_progress = args.progress_steps if args.progress_steps > 0 else None
-    for batch_start in range(0, len(indexed_rows), args.batch_size):
-        batch_end = min(batch_start + args.batch_size, len(indexed_rows))
+    batch_start = 0
+    while batch_start < len(indexed_rows):
+        batch_end = min(batch_start + batch_size, len(indexed_rows))
         indexed_batch = indexed_rows[batch_start:batch_end]
         batch_rows = [row for _, row in indexed_batch]
-        generated_texts = generate_batch(
-            model,
-            tokenizer,
-            batch_rows,
-            args.max_new_tokens,
-            stop_after_json=not args.disable_stop_after_json,
-        )
+        try:
+            generated_texts = generate_batch(
+                model,
+                tokenizer,
+                batch_rows,
+                args.max_new_tokens,
+                stop_after_json=not args.disable_stop_after_json,
+            )
+        except RuntimeError as error:
+            if is_cuda_out_of_memory(error) and batch_size > 1:
+                clear_cuda_cache()
+                old_batch_size = batch_size
+                batch_size = max(1, batch_size // 2)
+                print(
+                    f"CUDA OOM at batch size {old_batch_size}; retrying from row {completed} "
+                    f"with batch size {batch_size}",
+                    flush=True,
+                )
+                continue
+            raise
 
         for (idx, row), generated_text in zip(indexed_batch, generated_texts):
             raw = as_list(row["raw"])
@@ -349,6 +419,7 @@ def main() -> None:
                 print("source:", source)
 
         completed += len(indexed_batch)
+        batch_start = batch_end
         should_print_progress = completed == len(target)
         if next_progress is not None and completed >= next_progress:
             should_print_progress = True
