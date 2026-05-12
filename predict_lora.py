@@ -155,10 +155,13 @@ def model_id_from_adapter(adapter_dir: Path) -> str:
     return model_id
 
 
-def make_mfr_counts(data: Any) -> dict[str, dict[str, dict[str, int]]]:
+def make_mfr_counts(data: Any, target_split: str) -> dict[str, dict[str, dict[str, int]]]:
     from datasets import concatenate_datasets
 
-    train = concatenate_datasets([data["train"], data["validation"]])
+    if target_split == "test":
+        train = concatenate_datasets([data["train"], data["validation"]])
+    else:
+        train = data["train"]
     train_df = train.to_pandas()
     counts_by_lang = {}
     for lang, lang_df in train_df.groupby("lang"):
@@ -438,7 +441,7 @@ def main() -> None:
     print("Length-sorted batching:", "disabled" if args.no_sort_by_length else "enabled")
 
     needs_mfr_counts = args.fallback == "mfr" or args.prediction_strategy in {"mfr", "mfr-known", "mfr-confidence"}
-    counts_by_lang = make_mfr_counts(data) if needs_mfr_counts else None
+    counts_by_lang = make_mfr_counts(data, args.split) if needs_mfr_counts else None
     model = None
     tokenizer = None
     if args.prediction_strategy == "mfr":
