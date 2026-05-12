@@ -439,8 +439,14 @@ def main() -> None:
 
     needs_mfr_counts = args.fallback == "mfr" or args.prediction_strategy in {"mfr", "mfr-known", "mfr-confidence"}
     counts_by_lang = make_mfr_counts(data) if needs_mfr_counts else None
-    model, tokenizer = load_model_and_tokenizer(args, model_id)
-    batch_size, batch_size_reason = choose_batch_size(args.batch_size, args.max_new_tokens)
+    model = None
+    tokenizer = None
+    if args.prediction_strategy == "mfr":
+        batch_size = args.batch_size if args.batch_size > 0 else max(1, len(target))
+        batch_size_reason = "manual" if args.batch_size > 0 else "auto: model skipped for MFR-only prediction"
+    else:
+        model, tokenizer = load_model_and_tokenizer(args, model_id)
+        batch_size, batch_size_reason = choose_batch_size(args.batch_size, args.max_new_tokens)
     print(f"Batch size: {batch_size} ({batch_size_reason})")
 
     indexed_rows = list(enumerate(target))
@@ -457,26 +463,29 @@ def main() -> None:
         batch_end = min(batch_start + batch_size, len(indexed_rows))
         indexed_batch = indexed_rows[batch_start:batch_end]
         batch_rows = [row for _, row in indexed_batch]
-        try:
-            generated_texts = generate_batch(
-                model,
-                tokenizer,
-                batch_rows,
-                args.max_new_tokens,
-                stop_after_json=not args.disable_stop_after_json,
-            )
-        except RuntimeError as error:
-            if is_cuda_out_of_memory(error) and batch_size > 1:
-                clear_cuda_cache()
-                old_batch_size = batch_size
-                batch_size = max(1, batch_size // 2)
-                print(
-                    f"CUDA OOM at batch size {old_batch_size}; retrying from row {completed} "
-                    f"with batch size {batch_size}",
-                    flush=True,
+        if args.prediction_strategy == "mfr":
+            generated_texts = [""] * len(batch_rows)
+        else:
+            try:
+                generated_texts = generate_batch(
+                    model,
+                    tokenizer,
+                    batch_rows,
+                    args.max_new_tokens,
+                    stop_after_json=not args.disable_stop_after_json,
                 )
-                continue
-            raise
+            except RuntimeError as error:
+                if is_cuda_out_of_memory(error) and batch_size > 1:
+                    clear_cuda_cache()
+                    old_batch_size = batch_size
+                    batch_size = max(1, batch_size // 2)
+                    print(
+                        f"CUDA OOM at batch size {old_batch_size}; retrying from row {completed} "
+                        f"with batch size {batch_size}",
+                        flush=True,
+                    )
+                    continue
+                raise
 
         for (idx, row), generated_text in zip(indexed_batch, generated_texts):
             raw = as_list(row["raw"])
