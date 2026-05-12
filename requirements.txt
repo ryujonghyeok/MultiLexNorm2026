@@ -1,6 +1,6 @@
 pyarrow>=15.0.2
 datasets>=2.19.2
-numpy>=2.0
+numpy>=2.0,<2.1
 pandas>=2.2,<3.0
 torch
 transformers
