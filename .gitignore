@@ -1,6 +1,16 @@
 # OS files
 .DS_Store
 
+# Hugging Face dataset cache files
+data/**/cache-*.arrow
+
+# Large ML artifacts
+adapters/
+checkpoints/
+models/
+*.safetensors
+*.bin
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

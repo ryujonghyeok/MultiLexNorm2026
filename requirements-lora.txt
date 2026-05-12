@@ -1,0 +1,8 @@
+torch
+transformers
+accelerate
+datasets>=2.19.2
+peft
+bitsandbytes
+sentencepiece
+protobuf
