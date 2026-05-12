@@ -71,15 +71,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--quantization", choices=["4bit", "none"], default="4bit")
     parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-examples", type=int, default=0, help="0 means all examples.")
     parser.add_argument("--fallback", choices=["raw", "mfr"], default="mfr")
     parser.add_argument("--preview-examples", type=int, default=5)
+    parser.add_argument("--progress-steps", type=int, default=100)
+    parser.add_argument(
+        "--no-sort-by-length",
+        action="store_true",
+        help="Disable length-sorted batching. Sorting improves GPU throughput while preserving output order.",
+    )
     parser.add_argument(
         "--disable-stop-after-json",
         action="store_true",
         help="Keep generating until max_new_tokens instead of stopping after a valid JSON token list.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be greater than 0")
+    if args.max_new_tokens <= 0:
+        parser.error("--max-new-tokens must be greater than 0")
+    return args
 
 
 def resolve_output_dir(
@@ -175,62 +187,67 @@ def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[A
     return model, tokenizer
 
 
-def generation_config_for_inference(model: Any, tokenizer: Any) -> dict[str, Any]:
+def generation_config_for_inference(model: Any, tokenizer: Any, max_new_tokens: int) -> Any:
     generation_config = model.generation_config
     generation_config.do_sample = False
     generation_config.top_p = None
     generation_config.top_k = None
-    return {
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-        "generation_config": generation_config,
-    }
+    generation_config.pad_token_id = tokenizer.pad_token_id
+    generation_config.eos_token_id = tokenizer.eos_token_id
+    generation_config.max_new_tokens = max_new_tokens
+    return generation_config
 
 
-def make_stop_after_json(tokenizer: Any, prompt_len: int, expected_len: int) -> Any:
+def make_stop_after_json(tokenizer: Any, prompt_len: int, expected_lens: list[int]) -> Any:
     from transformers import StoppingCriteria
 
     class StopAfterValidJsonList(StoppingCriteria):
         def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
-            generated_ids = input_ids[0][prompt_len:]
-            text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            parsed = parse_json_list(text)
-            return (
-                isinstance(parsed, list)
-                and len(parsed) == expected_len
-                and all(isinstance(token, str) for token in parsed)
-            )
+            for row_idx, expected_len in enumerate(expected_lens):
+                generated_ids = input_ids[row_idx][prompt_len:]
+                text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                parsed = parse_json_list(text)
+                valid = (
+                    isinstance(parsed, list)
+                    and len(parsed) == expected_len
+                    and all(isinstance(token, str) for token in parsed)
+                )
+                if not valid:
+                    return False
+            return True
 
     return StopAfterValidJsonList()
 
 
-def generate_one(
+def generate_batch(
     model: Any,
     tokenizer: Any,
-    row: dict[str, Any],
+    rows: list[dict[str, Any]],
     max_new_tokens: int,
     stop_after_json: bool,
-) -> str:
+) -> list[str]:
     import torch
     from transformers import StoppingCriteriaList
 
-    prompt = render_prompt(tokenizer, row)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompts = [render_prompt(tokenizer, row) for row in rows]
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
     prompt_len = inputs["input_ids"].shape[-1]
     stopping_criteria = None
     if stop_after_json:
-        stopping_criteria = StoppingCriteriaList([make_stop_after_json(tokenizer, prompt_len, len(as_list(row["raw"])))])
+        expected_lens = [len(as_list(row["raw"])) for row in rows]
+        stopping_criteria = StoppingCriteriaList([make_stop_after_json(tokenizer, prompt_len, expected_lens)])
 
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
             stopping_criteria=stopping_criteria,
-            **generation_config_for_inference(model, tokenizer),
+            generation_config=generation_config_for_inference(model, tokenizer, max_new_tokens),
         )
-    generated_ids = output_ids[0][prompt_len:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    return [
+        tokenizer.decode(output_ids[row_idx][prompt_len:], skip_special_tokens=True).strip()
+        for row_idx in range(len(rows))
+    ]
 
 
 def write_submission(records: list[dict[str, Any]], output_dir: Path) -> tuple[Path, Path]:
@@ -268,45 +285,65 @@ def main() -> None:
     if args.max_examples and args.max_examples > 0:
         target = target.select(range(min(args.max_examples, len(target))))
     print("Prediction rows:", len(target))
+    print("Batch size:", args.batch_size)
+    print("Length-sorted batching:", "disabled" if args.no_sort_by_length else "enabled")
 
     counts_by_lang = make_mfr_counts(data) if args.fallback == "mfr" else None
     model, tokenizer = load_model_and_tokenizer(args, model_id)
 
-    records = []
-    source_counts = {"model": 0, "fallback": 0}
-    for idx, row in enumerate(target):
-        raw = as_list(row["raw"])
-        norm = as_list(row["norm"]) if "norm" in row else [""] * len(raw)
-        if len(norm) != len(raw):
-            norm = [""] * len(raw)
+    indexed_rows = list(enumerate(target))
+    if not args.no_sort_by_length:
+        indexed_rows.sort(key=lambda item: len(as_list(item[1]["raw"])))
 
-        generated_text = generate_one(
+    records: list[dict[str, Any] | None] = [None] * len(target)
+    source_counts = {"model": 0, "fallback": 0}
+    completed = 0
+    for batch_start in range(0, len(indexed_rows), args.batch_size):
+        batch_end = min(batch_start + args.batch_size, len(indexed_rows))
+        indexed_batch = indexed_rows[batch_start:batch_end]
+        batch_rows = [row for _, row in indexed_batch]
+        generated_texts = generate_batch(
             model,
             tokenizer,
-            row,
+            batch_rows,
             args.max_new_tokens,
             stop_after_json=not args.disable_stop_after_json,
         )
-        pred, source = normalize_prediction(generated_text, raw, row["lang"], args.fallback, counts_by_lang)
-        source_counts[source] += 1
 
-        records.append({"raw": raw, "norm": norm, "lang": row["lang"], "pred": pred})
+        for (idx, row), generated_text in zip(indexed_batch, generated_texts):
+            raw = as_list(row["raw"])
+            norm = as_list(row["norm"]) if "norm" in row else [""] * len(raw)
+            if len(norm) != len(raw):
+                norm = [""] * len(raw)
 
-        if idx < args.preview_examples:
-            print(f"\nExample {idx + 1}")
-            print("lang:", row["lang"])
-            print("raw: ", raw)
-            print("model_text:", generated_text)
-            print("pred:", pred)
-            print("source:", source)
+            pred, source = normalize_prediction(generated_text, raw, row["lang"], args.fallback, counts_by_lang)
+            source_counts[source] += 1
 
+            records[idx] = {"raw": raw, "norm": norm, "lang": row["lang"], "pred": pred}
+
+            if idx < args.preview_examples:
+                print(f"\nExample {idx + 1}")
+                print("lang:", row["lang"])
+                print("raw: ", raw)
+                print("model_text:", generated_text)
+                print("pred:", pred)
+                print("source:", source)
+
+        completed += len(indexed_batch)
+        if args.progress_steps > 0 and (completed % args.progress_steps == 0 or completed == len(target)):
+            print(f"Predicted {completed}/{len(target)} rows")
+
+    final_records: list[dict[str, Any]] = []
     for idx, record in enumerate(records):
+        if record is None:
+            raise ValueError(f"Missing prediction at row {idx}")
         if set(record) != {"raw", "norm", "lang", "pred"}:
             raise ValueError(f"Bad keys at row {idx}: {record.keys()}")
         if len(record["raw"]) != len(record["norm"]) or len(record["raw"]) != len(record["pred"]):
             raise ValueError(f"Length mismatch at row {idx}")
+        final_records.append(record)
 
-    predictions_path, zip_path = write_submission(records, output_dir)
+    predictions_path, zip_path = write_submission(final_records, output_dir)
     print("\nPrediction source counts:", source_counts)
     print(f"Wrote {predictions_path}")
     print(f"Wrote {zip_path}")
