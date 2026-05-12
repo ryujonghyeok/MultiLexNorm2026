@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Train a QLoRA adapter for MultiLexNorm.
+"""Train a QLoRA/LoRA adapter for MultiLexNorm.
 
-This script is intended for Colab GPU. It trains a PEFT LoRA adapter on
-MultiLexNorm raw -> norm examples and saves only the adapter folder.
+This script is intended for Colab GPU. By default it uses QLoRA: the
+base model is loaded in 4-bit quantized form, then a PEFT LoRA adapter is
+trained on MultiLexNorm raw -> norm examples. The saved artifact is still
+a LoRA adapter folder because QLoRA changes how the base model is loaded
+during training, not the adapter file format.
 """
 
 from __future__ import annotations
@@ -10,17 +13,39 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Gemma LoRA adapter for MultiLexNorm.")
+    parser = argparse.ArgumentParser(description="Train a Gemma QLoRA/LoRA adapter for MultiLexNorm.")
     parser.add_argument("--model-id", default="google/gemma-3-1b-it")
     parser.add_argument("--dataset-id", default="weerayut/multilexnorm2026-dev-pub")
-    parser.add_argument("--output-dir", default="adapters/gemma-multilexnorm-lora")
-    parser.add_argument("--hf-token", default=None, help="Optional Hugging Face token for gated models.")
+    parser.add_argument(
+        "--output-root",
+        default="adapters",
+        help="Parent directory for timestamped adapter output folders.",
+    )
+    parser.add_argument(
+        "--run-prefix",
+        default=None,
+        help="Prefix for the timestamped output directory. Defaults to the model name.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Explicit output directory. Prefer --output-root and --run-prefix for KST timestamped runs.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN"),
+        help="Optional Hugging Face token for gated models. Defaults to the HF_TOKEN environment variable.",
+    )
     parser.add_argument("--include-validation-in-train", action="store_true")
 
     parser.add_argument("--max-train-examples", type=int, default=1000)
@@ -47,10 +72,48 @@ def parse_args() -> argparse.Namespace:
         help='Comma-separated module names, or "all-linear" for every linear layer.',
     )
 
-    parser.add_argument("--no-4bit", action="store_true", help="Disable QLoRA 4-bit loading.")
+    parser.add_argument(
+        "--quantization",
+        choices=["4bit", "none"],
+        default="4bit",
+        help="Use '4bit' for QLoRA or 'none' for plain LoRA.",
+    )
+    parser.add_argument("--no-4bit", action="store_true", help="Deprecated alias for --quantization none.")
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--preview-examples", type=int, default=3)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.no_4bit:
+        args.quantization = "none"
+    return args
+
+
+def kst_timestamp() -> str:
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d_%H%M")
+
+
+def timestamped_name(prefix: str, timestamp: str) -> str:
+    prefix = prefix.strip().strip("_")
+    return f"{prefix}_{timestamp}" if prefix else timestamp
+
+
+def model_name_for_path(model_id: str) -> str:
+    model_name = model_id.rstrip("/").split("/")[-1]
+    model_name = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
+    return model_name or "model"
+
+
+def resolve_output_dir(args: argparse.Namespace) -> tuple[Path, str]:
+    timestamp = kst_timestamp()
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        if not re.search(r"\d{6}_\d{4}", output_dir.name):
+            raise ValueError(
+                "Explicit --output-dir must include a YYMMDD_HHMM timestamp in the final folder name. "
+                "Prefer --output-root plus --run-prefix so the script creates a KST timestamp automatically."
+            )
+        return output_dir, timestamp
+    prefix = args.run_prefix if args.run_prefix is not None else model_name_for_path(args.model_id)
+    return Path(args.output_root) / timestamped_name(prefix, timestamp), timestamp
 
 
 def as_list(value: Any) -> list[Any]:
@@ -181,7 +244,7 @@ def make_training_args(args: argparse.Namespace, has_eval: bool) -> Any:
         "save_total_limit": 2,
         "bf16": use_bf16,
         "fp16": use_fp16,
-        "optim": "paged_adamw_8bit" if not args.no_4bit else "adamw_torch",
+        "optim": "paged_adamw_8bit" if args.quantization == "4bit" else "adamw_torch",
         "report_to": "none",
         "remove_unused_columns": False,
         "gradient_checkpointing": True,
@@ -261,7 +324,8 @@ def main() -> None:
     if args.hf_token:
         login(token=args.hf_token)
 
-    output_dir = Path(args.output_dir)
+    output_dir, run_timestamp_kst = resolve_output_dir(args)
+    args.output_dir = str(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     data = load_multilexnorm(args.dataset_id)
@@ -277,15 +341,18 @@ def main() -> None:
 
     print("Training rows:", len(train_raw))
     print("Evaluation rows:", 0 if eval_raw is None else len(eval_raw))
+    print("Training mode:", "QLoRA 4-bit base model + LoRA adapter" if args.quantization == "4bit" else "Plain LoRA adapter")
+    print("Run timestamp (KST):", run_timestamp_kst)
+    print("Output directory:", output_dir)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, token=args.hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
     compute_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     quantization_config = None
-    if not args.no_4bit:
+    if args.quantization == "4bit":
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -296,11 +363,12 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         device_map="auto",
-        torch_dtype=compute_dtype,
+        dtype=compute_dtype,
         quantization_config=quantization_config,
+        token=args.hf_token,
     )
     model.config.use_cache = False
-    if not args.no_4bit:
+    if args.quantization == "4bit":
         model = prepare_model_for_kbit_training(model)
 
     target_modules: str | list[str]
@@ -347,10 +415,14 @@ def main() -> None:
 
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
+    metadata = vars(args).copy()
+    metadata["hf_token"] = "<set>" if args.hf_token else None
+    metadata["training_mode"] = "qlora_4bit" if args.quantization == "4bit" else "lora"
+    metadata["run_timestamp_kst"] = run_timestamp_kst
     with (output_dir / "train_lora_args.json").open("w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2, ensure_ascii=False)
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-    print(f"\nSaved LoRA adapter to: {args.output_dir}")
+    print(f"\nSaved {'QLoRA-trained ' if args.quantization == '4bit' else ''}LoRA adapter to: {args.output_dir}")
     print("Important adapter files:")
     print(f"- {output_dir / 'adapter_config.json'}")
     print(f"- {output_dir / 'adapter_model.safetensors'}")
