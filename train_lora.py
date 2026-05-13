@@ -22,9 +22,24 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
+DEFAULT_LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+GEMMA4_TEXT_LORA_TARGET_REGEX = (
+    r".*language_model.*?(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Gemma QLoRA/LoRA adapter for MultiLexNorm.")
     parser.add_argument("--model-id", default="google/gemma-3-1b-it")
+    parser.add_argument(
+        "--model-family",
+        choices=["auto", "generic", "gemma4"],
+        default="auto",
+        help=(
+            "Model-specific compatibility mode. 'auto' detects from the loaded config. "
+            "Use 'gemma4' to force Gemma 4 text-only training fixes; use 'generic' for Gemma 3, Qwen, Llama, etc."
+        ),
+    )
     parser.add_argument("--dataset-id", default="weerayut/multilexnorm2026-dev-pub")
     parser.add_argument(
         "--output-root",
@@ -77,8 +92,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument(
         "--lora-target-modules",
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        help='Comma-separated module names, or "all-linear" for every linear layer.',
+        default="auto",
+        help=(
+            'Comma-separated module names, "all-linear", "auto", or "regex:<pattern>". '
+            "For Gemma 4, auto targets only language_model projection layers to avoid multimodal towers."
+        ),
     )
 
     parser.add_argument(
@@ -182,7 +200,12 @@ def render_training_text(tokenizer: Any, row: dict[str, Any]) -> tuple[str, str]
     return prompt, full
 
 
-def tokenize_example(row: dict[str, Any], tokenizer: Any, max_length: int) -> dict[str, list[int]]:
+def tokenize_example(
+    row: dict[str, Any],
+    tokenizer: Any,
+    max_length: int,
+    model_family: str,
+) -> dict[str, list[int]]:
     prompt, full = render_training_text(tokenizer, row)
     prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
     full_enc = tokenizer(full, truncation=True, max_length=max_length, add_special_tokens=False)
@@ -191,11 +214,15 @@ def tokenize_example(row: dict[str, Any], tokenizer: Any, max_length: int) -> di
     prompt_len = min(len(prompt_ids), len(labels))
     labels[:prompt_len] = [-100] * prompt_len
 
-    return {
+    tokenized = {
         "input_ids": full_enc["input_ids"],
         "attention_mask": full_enc["attention_mask"],
         "labels": labels,
     }
+    if model_family == "gemma4":
+        tokenized["token_type_ids"] = [0] * len(full_enc["input_ids"])
+        tokenized["mm_token_type_ids"] = [0] * len(full_enc["input_ids"])
+    return tokenized
 
 
 @dataclass
@@ -210,7 +237,7 @@ class CausalLMCollator:
         def pad(values: list[int], pad_value: int) -> list[int]:
             return values + [pad_value] * (max_len - len(values))
 
-        return {
+        batch = {
             "input_ids": torch.tensor(
                 [pad(feature["input_ids"], self.pad_token_id) for feature in features],
                 dtype=torch.long,
@@ -224,6 +251,17 @@ class CausalLMCollator:
                 dtype=torch.long,
             ),
         }
+        if "token_type_ids" in features[0]:
+            batch["token_type_ids"] = torch.tensor(
+                [pad(feature["token_type_ids"], 0) for feature in features],
+                dtype=torch.long,
+            )
+        if "mm_token_type_ids" in features[0]:
+            batch["mm_token_type_ids"] = torch.tensor(
+                [pad(feature["mm_token_type_ids"], 0) for feature in features],
+                dtype=torch.long,
+            )
+        return batch
 
 
 def subset(dataset: Any, max_examples: int | None, seed: int) -> Any:
@@ -300,6 +338,42 @@ def make_training_args(args: argparse.Namespace, has_eval: bool) -> Any:
         kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
 
     return TrainingArguments(**kwargs)
+
+
+def model_type_name(model: Any) -> str:
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", "")
+    return str(model_type or model.__class__.__name__).lower()
+
+
+def resolve_model_family(args: argparse.Namespace, model: Any) -> str:
+    if args.model_family != "auto":
+        return args.model_family
+    model_name = model_type_name(model)
+    class_name = model.__class__.__name__.lower()
+    if "gemma4" in model_name or "gemma4" in class_name:
+        return "gemma4"
+    return "generic"
+
+
+def resolve_lora_target_modules(args: argparse.Namespace, model_family: str) -> str | list[str]:
+    target_spec = args.lora_target_modules.strip()
+    if target_spec == "auto":
+        if model_family == "gemma4":
+            return GEMMA4_TEXT_LORA_TARGET_REGEX
+        target_spec = DEFAULT_LORA_TARGET_MODULES
+    if model_family == "gemma4" and target_spec == "linear":
+        raise ValueError(
+            "--lora-target-modules linear is not valid for Gemma 4 text LoRA. "
+            "It can attach adapters outside the language loss path. "
+            "Use the default auto setting, or pass "
+            f"--lora-target-modules 'regex:{GEMMA4_TEXT_LORA_TARGET_REGEX}'."
+        )
+    if target_spec.startswith("regex:"):
+        return target_spec.removeprefix("regex:")
+    if target_spec == "all-linear":
+        return "all-linear"
+    return [item.strip() for item in target_spec.split(",") if item.strip()]
 
 
 def parse_json_list(text: str) -> list[Any] | None:
@@ -408,11 +482,11 @@ def main() -> None:
     if args.quantization == "4bit":
         model = prepare_model_for_kbit_training(model)
 
-    target_modules: str | list[str]
-    if args.lora_target_modules == "all-linear":
-        target_modules = "all-linear"
-    else:
-        target_modules = [item.strip() for item in args.lora_target_modules.split(",") if item.strip()]
+    resolved_model_family = resolve_model_family(args, model)
+    print("Model family:", resolved_model_family)
+
+    target_modules = resolve_lora_target_modules(args, resolved_model_family)
+    print("LoRA target modules:", target_modules)
 
     peft_config = LoraConfig(
         r=args.lora_r,
@@ -426,14 +500,14 @@ def main() -> None:
     model.print_trainable_parameters()
 
     tokenized_train = train_raw.map(
-        lambda row: tokenize_example(row, tokenizer, args.max_length),
+        lambda row: tokenize_example(row, tokenizer, args.max_length, resolved_model_family),
         remove_columns=train_raw.column_names,
         desc="Tokenizing train",
     )
     tokenized_eval = None
     if eval_raw is not None and len(eval_raw) > 0:
         tokenized_eval = eval_raw.map(
-            lambda row: tokenize_example(row, tokenizer, args.max_length),
+            lambda row: tokenize_example(row, tokenizer, args.max_length, resolved_model_family),
             remove_columns=eval_raw.column_names,
             desc="Tokenizing validation",
         )
@@ -456,6 +530,7 @@ def main() -> None:
     metadata["hf_token"] = "<set>" if args.hf_token else None
     metadata["training_mode"] = "qlora_4bit" if args.quantization == "4bit" else "lora"
     metadata["run_timestamp_kst"] = run_timestamp_kst
+    metadata["resolved_model_family"] = resolved_model_family
     with (output_dir / "train_lora_args.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
