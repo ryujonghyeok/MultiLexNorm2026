@@ -25,6 +25,10 @@ from train_lora import (
 from utils import counting, evaluate, mfr
 
 
+DEFAULT_LANG_BEST_MFR_LANGS = "id,iden,sr"
+
+
+
 def check_torchao_version() -> None:
     try:
         version = importlib.metadata.version("torchao")
@@ -82,14 +86,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback", choices=["raw", "mfr"], default="mfr")
     parser.add_argument(
         "--prediction-strategy",
-        choices=["model", "mfr", "mfr-known", "mfr-confidence"],
+        choices=["model", "mfr", "mfr-known", "mfr-confidence", "lang-best"],
         default="mfr-known",
         help=(
             "How to combine model predictions with MFR. "
             "'model' uses valid model JSON directly. "
             "'mfr' ignores the model output. "
             "'mfr-known' uses MFR for tokens seen in public train/validation and model only for unseen tokens. "
-            "'mfr-confidence' uses model only when MFR confidence is below --mfr-confidence-threshold."
+            "'mfr-confidence' uses model only when MFR confidence is below --mfr-confidence-threshold. "
+            "'lang-best' uses validation-derived language routing between model and mfr-known."
+        ),
+    )
+    parser.add_argument(
+        "--lang-best-mfr-langs",
+        default=DEFAULT_LANG_BEST_MFR_LANGS,
+        help=(
+            "Comma-separated language codes that should use mfr-known under --prediction-strategy lang-best. "
+            "All other languages use the model output. Use 'none' to force model-only."
+        ),
+    )
+    parser.add_argument(
+        "--force-model",
+        nargs="*",
+        default=[],
+        metavar="LANG",
+        help=(
+            "Language codes that must use the model output even when the strategy would use MFR. "
+            "Examples: --force-model ko ja or --force-model 'ko,ja'."
         ),
     )
     parser.add_argument(
@@ -191,6 +214,21 @@ def mfr_token_confidence(raw_token: str, token_counts: dict[str, dict[str, int]]
     return max(replacements.values()) / total
 
 
+def prediction_strategy_slug(prediction_strategy: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", prediction_strategy).replace("-", "_").strip("_")
+
+
+def parse_lang_codes(value: str) -> set[str]:
+    value = value.strip()
+    if value.lower() in {"", "none"}:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def parse_lang_code_args(values: list[str]) -> set[str]:
+    return parse_lang_codes(",".join(values))
+
+
 def parse_model_prediction(generated_text: str, raw: list[str]) -> list[str] | None:
     parsed = parse_json_list(generated_text)
     if isinstance(parsed, list) and len(parsed) == len(raw) and all(isinstance(token, str) for token in parsed):
@@ -206,14 +244,24 @@ def choose_prediction(
     counts_by_lang: dict[str, Any] | None,
     strategy: str,
     mfr_confidence_threshold: float,
+    lang_best_mfr_langs: set[str] | None,
+    force_model_langs: set[str],
 ) -> tuple[list[str], str]:
     fallback_pred = fallback_prediction(raw, lang, fallback, counts_by_lang)
     if strategy == "mfr":
         return fallback_pred, "mfr"
     if model_pred is None:
         return fallback_pred, "fallback"
+    if lang in force_model_langs:
+        return model_pred, "model"
     if strategy == "model" or counts_by_lang is None:
         return model_pred, "model"
+
+    if strategy == "lang-best":
+        if lang_best_mfr_langs is not None and lang in lang_best_mfr_langs:
+            strategy = "mfr-known"
+        else:
+            return model_pred, "model"
 
     token_counts = counts_by_lang.get(lang, {})
     pred = []
@@ -454,10 +502,11 @@ def generate_batch(
     ]
 
 
-def write_submission(records: list[dict[str, Any]], output_dir: Path) -> tuple[Path, Path]:
+def write_submission(records: list[dict[str, Any]], output_dir: Path, prediction_strategy: str) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions.json"
-    zip_path = output_dir.with_suffix(".zip")
+    strategy = prediction_strategy_slug(prediction_strategy)
+    zip_path = output_dir.parent / f"{output_dir.name}({strategy}).zip"
 
     with predictions_path.open("w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False)
@@ -486,6 +535,15 @@ def main() -> None:
     print("Prediction strategy:", args.prediction_strategy)
     if args.prediction_strategy == "mfr-confidence":
         print("MFR confidence threshold:", args.mfr_confidence_threshold)
+    force_model_langs = parse_lang_code_args(args.force_model)
+    if force_model_langs and args.prediction_strategy == "mfr":
+        raise ValueError("--force-model cannot be used with --prediction-strategy mfr because the model is skipped.")
+    if force_model_langs:
+        print("Force-model languages:", ", ".join(sorted(force_model_langs)))
+    lang_best_mfr_langs = None
+    if args.prediction_strategy == "lang-best":
+        lang_best_mfr_langs = parse_lang_codes(args.lang_best_mfr_langs)
+        print("Lang-best mfr-known languages:", ", ".join(sorted(lang_best_mfr_langs)) or "(none)")
 
     data = load_multilexnorm(args.dataset_id)
     target = data[args.split]
@@ -494,7 +552,12 @@ def main() -> None:
     print("Prediction rows:", len(target))
     print("Length-sorted batching:", "disabled" if args.no_sort_by_length else "enabled")
 
-    needs_mfr_counts = args.fallback == "mfr" or args.prediction_strategy in {"mfr", "mfr-known", "mfr-confidence"}
+    needs_mfr_counts = args.fallback == "mfr" or args.prediction_strategy in {
+        "mfr",
+        "mfr-known",
+        "mfr-confidence",
+        "lang-best",
+    }
     counts_by_lang = make_mfr_counts(data, args.split) if needs_mfr_counts else None
     model = None
     tokenizer = None
@@ -559,6 +622,8 @@ def main() -> None:
                 counts_by_lang,
                 args.prediction_strategy,
                 args.mfr_confidence_threshold,
+                lang_best_mfr_langs,
+                force_model_langs,
             )
             source_counts[source] += 1
 
@@ -606,7 +671,7 @@ def main() -> None:
             raise ValueError(f"Length mismatch at row {idx}")
         final_records.append(record)
 
-    predictions_path, zip_path = write_submission(final_records, output_dir)
+    predictions_path, zip_path = write_submission(final_records, output_dir, args.prediction_strategy)
     if has_public_gold(final_records):
         print("\nValidation score:")
         evaluate(
