@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help="For --prediction-strategy mfr-confidence, use MFR when top replacement frequency is at least this value.",
     )
+    parser.add_argument(
+        "--mfr-languages",
+        default="",
+        help="Comma-separated language codes to force through MFR instead of the model, e.g. ja,ko.",
+    )
     parser.add_argument("--preview-examples", type=int, default=5)
     parser.add_argument(
         "--progress-steps",
@@ -173,6 +178,10 @@ def fallback_prediction(raw: list[str], lang: str, fallback: str, counts_by_lang
     if fallback == "mfr" and counts_by_lang is not None:
         return mfr(raw, counts_by_lang.get(lang, {}))
     return list(raw)
+
+
+def parse_language_codes(value: str) -> set[str]:
+    return {part.strip() for part in value.split(",") if part.strip()}
 
 
 def mfr_token_prediction(raw_token: str, token_counts: dict[str, dict[str, int]]) -> str:
@@ -486,6 +495,8 @@ def main() -> None:
     print("Prediction strategy:", args.prediction_strategy)
     if args.prediction_strategy == "mfr-confidence":
         print("MFR confidence threshold:", args.mfr_confidence_threshold)
+    mfr_languages = parse_language_codes(args.mfr_languages)
+    print("Forced MFR languages:", ",".join(sorted(mfr_languages)) if mfr_languages else "none")
 
     data = load_multilexnorm(args.dataset_id)
     target = data[args.split]
@@ -494,7 +505,11 @@ def main() -> None:
     print("Prediction rows:", len(target))
     print("Length-sorted batching:", "disabled" if args.no_sort_by_length else "enabled")
 
-    needs_mfr_counts = args.fallback == "mfr" or args.prediction_strategy in {"mfr", "mfr-known", "mfr-confidence"}
+    needs_mfr_counts = (
+        args.fallback == "mfr"
+        or bool(mfr_languages)
+        or args.prediction_strategy in {"mfr", "mfr-known", "mfr-confidence"}
+    )
     counts_by_lang = make_mfr_counts(data, args.split) if needs_mfr_counts else None
     model = None
     tokenizer = None
@@ -511,7 +526,7 @@ def main() -> None:
         indexed_rows.sort(key=lambda item: len(as_list(item[1]["raw"])))
 
     records: list[dict[str, Any] | None] = [None] * len(target)
-    source_counts = {"model": 0, "hybrid": 0, "mfr": 0, "fallback": 0}
+    source_counts = {"model": 0, "hybrid": 0, "mfr": 0, "mfr-language": 0, "fallback": 0}
     completed = 0
     started_at = time.monotonic()
     next_progress = args.progress_steps if args.progress_steps > 0 else None
@@ -550,16 +565,20 @@ def main() -> None:
             if len(norm) != len(raw):
                 norm = [""] * len(raw)
 
-            model_pred = parse_model_prediction(generated_text, raw)
-            pred, source = choose_prediction(
-                model_pred,
-                raw,
-                row["lang"],
-                args.fallback,
-                counts_by_lang,
-                args.prediction_strategy,
-                args.mfr_confidence_threshold,
-            )
+            if row["lang"] in mfr_languages:
+                pred = fallback_prediction(raw, row["lang"], "mfr", counts_by_lang)
+                source = "mfr-language"
+            else:
+                model_pred = parse_model_prediction(generated_text, raw)
+                pred, source = choose_prediction(
+                    model_pred,
+                    raw,
+                    row["lang"],
+                    args.fallback,
+                    counts_by_lang,
+                    args.prediction_strategy,
+                    args.mfr_confidence_threshold,
+                )
             source_counts[source] += 1
 
             records[idx] = {"raw": raw, "norm": norm, "lang": row["lang"], "pred": pred}
@@ -592,7 +611,8 @@ def main() -> None:
                 f"elapsed {format_duration(elapsed)} | "
                 f"ETA {format_duration(eta)} | "
                 f"model {source_counts['model']} / hybrid {source_counts['hybrid']} / "
-                f"mfr {source_counts['mfr']} / fallback {source_counts['fallback']}",
+                f"mfr {source_counts['mfr']} / mfr-language {source_counts['mfr-language']} / "
+                f"fallback {source_counts['fallback']}",
                 flush=True,
             )
 
