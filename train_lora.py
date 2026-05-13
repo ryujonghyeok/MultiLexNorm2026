@@ -26,6 +26,9 @@ DEFAULT_LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,dow
 GEMMA4_TEXT_LORA_TARGET_REGEX = (
     r".*language_model.*?(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
 )
+QWEN35_TEXT_LORA_TARGET_REGEX = (
+    r".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj|out_proj)"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,11 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default="google/gemma-3-1b-it")
     parser.add_argument(
         "--model-family",
-        choices=["auto", "generic", "gemma4"],
+        choices=["auto", "generic", "gemma4", "qwen3_5"],
         default="auto",
         help=(
             "Model-specific compatibility mode. 'auto' detects from the loaded config. "
-            "Use 'gemma4' to force Gemma 4 text-only training fixes; use 'generic' for Gemma 3, Qwen, Llama, etc."
+            "Use 'gemma4' to force Gemma 4 text-only training fixes; "
+            "use 'qwen3_5' for the experimental Qwen3.5 multimodal loader; "
+            "use 'generic' for Gemma 3, Qwen text-only, Llama, etc."
         ),
     )
     parser.add_argument("--dataset-id", default="weerayut/multilexnorm2026-dev-pub")
@@ -60,6 +65,11 @@ def parse_args() -> argparse.Namespace:
         "--hf-token",
         default=os.environ.get("HF_TOKEN"),
         help="Optional Hugging Face token for gated models. Defaults to the HF_TOKEN environment variable.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow remote model code when loading very new architectures.",
     )
     parser.add_argument("--include-validation-in-train", action="store_true")
 
@@ -346,6 +356,11 @@ def model_type_name(model: Any) -> str:
     return str(model_type or model.__class__.__name__).lower()
 
 
+def model_id_suggests_qwen35(model_id: str) -> bool:
+    compact = model_id.lower().replace("-", "").replace("_", "").replace(".", "")
+    return "qwen35" in compact
+
+
 def resolve_model_family(args: argparse.Namespace, model: Any) -> str:
     if args.model_family != "auto":
         return args.model_family
@@ -353,6 +368,8 @@ def resolve_model_family(args: argparse.Namespace, model: Any) -> str:
     class_name = model.__class__.__name__.lower()
     if "gemma4" in model_name or "gemma4" in class_name:
         return "gemma4"
+    if "qwen3_5" in model_name or "qwen3_5" in class_name or model_id_suggests_qwen35(args.model_id):
+        return "qwen3_5"
     return "generic"
 
 
@@ -361,6 +378,8 @@ def resolve_lora_target_modules(args: argparse.Namespace, model_family: str) -> 
     if target_spec == "auto":
         if model_family == "gemma4":
             return GEMMA4_TEXT_LORA_TARGET_REGEX
+        if model_family == "qwen3_5":
+            return QWEN35_TEXT_LORA_TARGET_REGEX
         target_spec = DEFAULT_LORA_TARGET_MODULES
     if model_family == "gemma4" and target_spec == "linear":
         raise ValueError(
@@ -374,6 +393,63 @@ def resolve_lora_target_modules(args: argparse.Namespace, model_family: str) -> 
     if target_spec == "all-linear":
         return "all-linear"
     return [item.strip() for item in target_spec.split(",") if item.strip()]
+
+
+def load_tokenizer_for_training(args: argparse.Namespace) -> Any:
+    from transformers import AutoProcessor, AutoTokenizer
+
+    loader_kwargs = {"token": args.hf_token, "trust_remote_code": args.trust_remote_code}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_id, **loader_kwargs)
+    except Exception as tokenizer_error:
+        if args.model_family not in {"auto", "qwen3_5"} and not model_id_suggests_qwen35(args.model_id):
+            raise
+        print(f"AutoTokenizer failed; trying AutoProcessor tokenizer for {args.model_id}.")
+        processor = AutoProcessor.from_pretrained(args.model_id, **loader_kwargs)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(f"AutoProcessor for {args.model_id} does not expose a tokenizer.") from tokenizer_error
+    return tokenizer
+
+
+def load_base_model_for_training(args: argparse.Namespace, compute_dtype: Any, quantization_config: Any) -> Any:
+    from transformers import AutoModelForCausalLM
+
+    loader_kwargs = {
+        "device_map": "auto",
+        "dtype": compute_dtype,
+        "quantization_config": quantization_config,
+        "token": args.hf_token,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    family_hint = args.model_family
+    if family_hint == "auto" and model_id_suggests_qwen35(args.model_id):
+        family_hint = "qwen3_5"
+
+    if family_hint == "qwen3_5":
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:
+            AutoModelForImageTextToText = None
+        if AutoModelForImageTextToText is not None:
+            print("Loading Qwen3.5 with AutoModelForImageTextToText.")
+            return AutoModelForImageTextToText.from_pretrained(args.model_id, **loader_kwargs)
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(args.model_id, **loader_kwargs)
+    except Exception as causal_error:
+        if family_hint != "qwen3_5":
+            raise
+        from transformers import AutoModelForImageTextToText
+
+        print("AutoModelForCausalLM failed; retrying Qwen3.5 with AutoModelForImageTextToText.")
+        try:
+            return AutoModelForImageTextToText.from_pretrained(args.model_id, **loader_kwargs)
+        except Exception as image_text_error:
+            raise RuntimeError(
+                "Could not load Qwen3.5 with either AutoModelForCausalLM or AutoModelForImageTextToText. "
+                "Try updating Transformers from source in Colab if this architecture is newer than the release."
+            ) from image_text_error
 
 
 def parse_json_list(text: str) -> list[Any] | None:
@@ -430,7 +506,7 @@ def main() -> None:
     from datasets import concatenate_datasets
     from huggingface_hub import login
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer
+    from transformers import BitsAndBytesConfig, Trainer
 
     if args.hf_token:
         login(token=args.hf_token)
@@ -456,7 +532,7 @@ def main() -> None:
     print("Run timestamp (KST):", run_timestamp_kst)
     print("Output directory:", output_dir)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, token=args.hf_token)
+    tokenizer = load_tokenizer_for_training(args)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -471,13 +547,7 @@ def main() -> None:
             bnb_4bit_compute_dtype=compute_dtype,
         )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        device_map="auto",
-        dtype=compute_dtype,
-        quantization_config=quantization_config,
-        token=args.hf_token,
-    )
+    model = load_base_model_for_training(args, compute_dtype, quantization_config)
     model.config.use_cache = False
     if args.quantization == "4bit":
         model = prepare_model_for_kbit_training(model)

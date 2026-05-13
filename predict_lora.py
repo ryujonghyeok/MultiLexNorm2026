@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from train_lora import (
     as_list,
     load_multilexnorm,
+    model_id_suggests_qwen35,
     model_name_for_path,
     parse_json_list,
     render_prompt,
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate Codabench predictions with Gemma + LoRA adapter.")
     parser.add_argument("--adapter-dir", required=True, help="Path to the trained LoRA adapter folder.")
     parser.add_argument("--model-id", default=None, help="Base model ID. Defaults to adapter_config.json value.")
+    parser.add_argument(
+        "--model-family",
+        choices=["auto", "generic", "qwen3_5"],
+        default="auto",
+        help="Model loader mode. Use qwen3_5 for experimental Qwen3.5 image-text models.",
+    )
     parser.add_argument("--dataset-id", default="weerayut/multilexnorm2026-dev-pub")
     parser.add_argument("--split", default="test")
     parser.add_argument(
@@ -69,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         "--hf-token",
         default=os.environ.get("HF_TOKEN"),
         help="Optional Hugging Face token for gated models. Defaults to HF_TOKEN.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow remote model code when loading very new architectures.",
     )
     parser.add_argument("--quantization", choices=["4bit", "none"], default="4bit")
     parser.add_argument("--max-new-tokens", type=int, default=96)
@@ -361,9 +373,19 @@ def is_cuda_out_of_memory(error: Exception) -> bool:
 def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[Any, Any]:
     import torch
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoProcessor, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, token=args.hf_token)
+    loader_kwargs = {"token": args.hf_token, "trust_remote_code": args.trust_remote_code}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, **loader_kwargs)
+    except Exception as tokenizer_error:
+        if args.model_family not in {"auto", "qwen3_5"} and not model_id_suggests_qwen35(model_id):
+            raise
+        print(f"AutoTokenizer failed; trying AutoProcessor tokenizer for {model_id}.")
+        processor = AutoProcessor.from_pretrained(model_id, **loader_kwargs)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(f"AutoProcessor for {model_id} does not expose a tokenizer.") from tokenizer_error
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -378,13 +400,29 @@ def load_model_and_tokenizer(args: argparse.Namespace, model_id: str) -> tuple[A
             bnb_4bit_compute_dtype=compute_dtype,
         )
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="auto",
-        dtype=compute_dtype,
-        quantization_config=quantization_config,
-        token=args.hf_token,
-    )
+    model_loader_kwargs = {
+        "device_map": "auto",
+        "dtype": compute_dtype,
+        "quantization_config": quantization_config,
+        "token": args.hf_token,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    family_hint = args.model_family
+    if family_hint == "auto" and model_id_suggests_qwen35(model_id):
+        family_hint = "qwen3_5"
+    if family_hint == "qwen3_5":
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError as error:
+            raise RuntimeError(
+                "This Transformers install does not expose AutoModelForImageTextToText. "
+                "Update Transformers before loading Qwen3.5."
+            ) from error
+        print("Loading Qwen3.5 with AutoModelForImageTextToText.")
+        base_model = AutoModelForImageTextToText.from_pretrained(model_id, **model_loader_kwargs)
+    else:
+        base_model = AutoModelForCausalLM.from_pretrained(model_id, **model_loader_kwargs)
+
     check_torchao_version()
     model = PeftModel.from_pretrained(base_model, args.adapter_dir)
     model.eval()
