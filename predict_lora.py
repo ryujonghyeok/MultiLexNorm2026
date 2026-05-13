@@ -492,10 +492,15 @@ def generate_batch(
     ]
 
 
-def write_submission(records: list[dict[str, Any]], output_dir: Path) -> tuple[Path, Path]:
+def prediction_strategy_slug(prediction_strategy: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", prediction_strategy).replace("-", "_").strip("_")
+
+
+def write_submission(records: list[dict[str, Any]], output_dir: Path, prediction_strategy: str) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions.json"
-    zip_path = output_dir.with_suffix(".zip")
+    strategy = prediction_strategy_slug(prediction_strategy)
+    zip_path = output_dir.parent / f"{output_dir.name}({strategy}).zip"
 
     with predictions_path.open("w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False)
@@ -644,7 +649,7 @@ def main() -> None:
             raise ValueError(f"Length mismatch at row {idx}")
         final_records.append(record)
 
-    predictions_path, zip_path = write_submission(final_records, output_dir)
+    predictions_path, zip_path = write_submission(final_records, output_dir, args.prediction_strategy)
     if has_public_gold(final_records):
         print("\nValidation score:")
         evaluate(
