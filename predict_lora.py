@@ -10,17 +10,17 @@ import os
 import re
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from train_lora import (
     as_list,
-    kst_timestamp,
     load_multilexnorm,
     model_name_for_path,
     parse_json_list,
     render_prompt,
-    timestamped_name,
 )
 from utils import counting, evaluate, mfr
 
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-prefix",
         default=None,
-        help="Prefix for the timestamped output directory and ZIP file. Defaults to the model name.",
+        help="Prefix for the timestamped output directory and ZIP file. Defaults to the adapter folder name.",
     )
     parser.add_argument(
         "--output-dir",
@@ -129,19 +129,19 @@ def resolve_output_dir(
     output_dir: str | None,
     output_root: str,
     run_prefix: str | None,
-    model_id: str,
+    adapter_dir: Path,
 ) -> tuple[Path, str]:
-    timestamp = kst_timestamp()
+    timestamp = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%m%d-%H%M")
     if output_dir:
         path = Path(output_dir)
-        if not re.search(r"\d{6}_\d{4}", path.name):
+        if not re.search(r"(\d{4}-\d{4}|\d{6}_\d{4})", path.name):
             raise ValueError(
-                "Explicit --output-dir must include a YYMMDD_HHMM timestamp in the final folder name. "
+                "Explicit --output-dir must include an MMDD-HHMM timestamp in the final folder name. "
                 "Prefer --output-root plus --run-prefix so the script creates a KST timestamp automatically."
             )
         return path, timestamp
-    prefix = run_prefix if run_prefix is not None else model_name_for_path(model_id)
-    return Path(output_root) / timestamped_name(prefix, timestamp), timestamp
+    prefix = run_prefix if run_prefix is not None else model_name_for_path(adapter_dir.name)
+    return Path(output_root) / f"{prefix}_{timestamp}", timestamp
 
 
 def model_id_from_adapter(adapter_dir: Path) -> str:
@@ -421,7 +421,7 @@ def main() -> None:
         raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
 
     model_id = args.model_id or model_id_from_adapter(adapter_dir)
-    output_dir, run_timestamp_kst = resolve_output_dir(args.output_dir, args.output_root, args.run_prefix, model_id)
+    output_dir, run_timestamp_kst = resolve_output_dir(args.output_dir, args.output_root, args.run_prefix, adapter_dir)
 
     print("Adapter directory:", adapter_dir)
     print("Base model:", model_id)
