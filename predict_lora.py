@@ -243,6 +243,60 @@ def has_public_gold(records: list[dict[str, Any]]) -> bool:
     return any(any(token != "" for token in record["norm"]) for record in records)
 
 
+def score_records(records: list[dict[str, Any]]) -> tuple[int, int, int, float, float, float | None]:
+    correct = 0
+    changed = 0
+    total = 0
+    for record in records:
+        for raw_token, gold_token, pred_token in zip(record["raw"], record["norm"], record["pred"]):
+            if raw_token != gold_token:
+                changed += 1
+            if gold_token == pred_token:
+                correct += 1
+            total += 1
+
+    if total == 0:
+        return 0, 0, 0, 0.0, 0.0, None
+
+    lai = (total - changed) / total
+    accuracy = correct / total
+    err = None if changed == 0 else (accuracy - lai) / (1 - lai)
+    return total, changed, correct, lai, accuracy, err
+
+
+def print_score_by_language(records: list[dict[str, Any]]) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(record["lang"], []).append(record)
+
+    rows = []
+    for lang, lang_records in grouped.items():
+        total, changed, _correct, lai, accuracy, err = score_records(lang_records)
+        rows.append(
+            {
+                "lang": lang,
+                "sentences": len(lang_records),
+                "tokens": total,
+                "changed": changed,
+                "lai": lai,
+                "accuracy": accuracy,
+                "err": err,
+            }
+        )
+
+    rows.sort(key=lambda row: -1.0 if row["err"] is None else row["err"], reverse=True)
+
+    print("\nValidation score by language:")
+    print(f"{'lang':<8} {'sent':>6} {'tokens':>8} {'changed':>8} {'LAI':>8} {'Accuracy':>9} {'ERR':>8}")
+    print("-" * 65)
+    for row in rows:
+        err_text = "n/a" if row["err"] is None else f"{row['err'] * 100:6.2f}"
+        print(
+            f"{row['lang']:<8} {row['sentences']:>6} {row['tokens']:>8} {row['changed']:>8} "
+            f"{row['lai'] * 100:>8.2f} {row['accuracy'] * 100:>9.2f} {err_text:>8}"
+        )
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     minutes, seconds = divmod(seconds, 60)
@@ -560,6 +614,7 @@ def main() -> None:
             gold=[record["norm"] for record in final_records],
             pred=[record["pred"] for record in final_records],
         )
+        print_score_by_language(final_records)
     print("\nPrediction source counts:", source_counts)
     print(f"Wrote {predictions_path}")
     print(f"Wrote {zip_path}")
